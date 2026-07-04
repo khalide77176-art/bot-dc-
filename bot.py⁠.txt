@@ -1,0 +1,169 @@
+import re
+import os
+import discord
+import asyncio
+import signal
+from urllib.parse import urlparse, parse_qs
+from discord.ui import Button, View
+from playwright.async_api import async_playwright
+from cachetools import LRUCache
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+INVITE_CODE = "0GAVT4"
+
+cache = LRUCache(maxsize=100)
+cache_lock = asyncio.Lock()
+
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+
+browser = None
+playwright = None
+
+shutdown_event = asyncio.Event()
+
+
+async def init_browser():
+    global playwright, browser
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+
+
+async def shutdown():
+    global browser, playwright
+    if browser:
+        await browser.close()
+    if playwright:
+        await playwright.stop()
+
+
+def handle_exit(*args):
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
+
+def extract_data(content):
+    url_match = re.search(r"(https?://[^\s]+)", content)
+    if not url_match:
+        return None, None, None
+
+    url = url_match.group(1)
+    parsed = urlparse(url)
+
+    if "weidian" in parsed.netloc:
+        return "weidian", parse_qs(parsed.query).get("itemID", [None])[0], url
+
+    if "taobao" in parsed.netloc:
+        return "taobao", parse_qs(parsed.query).get("id", [None])[0], url
+
+    if "1688" in parsed.netloc:
+        match = re.search(r"offer/(\d+)", url)
+        return "1688", match.group(1) if match else None, url
+
+    return None, None, url
+
+
+async def get_info(url):
+    global browser
+
+    if browser is None:
+        await init_browser()
+
+    page = await browser.new_page()
+    try:
+        await page.goto(url, timeout=15000, wait_until="domcontentloaded")
+
+        title = (await page.title())[:80]
+
+        meta = await page.query_selector("meta[property='og:image']")
+        image = await meta.get_attribute("content") if meta else None
+
+        return title, image
+
+    except Exception as e:
+        print("Erreur scraping:", e)
+        return "Produit introuvable", None
+
+    finally:
+        await page.close()
+
+
+@client.event
+async def on_ready():
+    await init_browser()
+    print(f"Bot connecté : {client.user}")
+
+
+@client.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    shop, item_id, url = extract_data(message.content)
+
+    if not url:
+        return
+
+    # 🔥 UX : lien shopping invalide
+    if any(x in url for x in ["taobao", "weidian", "1688"]):
+        if not shop or not item_id:
+            await message.channel.send(
+                "❌ Lien détecté mais invalide ou incomplet.",
+                delete_after=5
+            )
+            return
+
+    if not shop or not item_id:
+        return
+
+    try:
+        if message.guild and message.guild.me:
+            if message.channel.permissions_for(message.guild.me).manage_messages:
+                await message.delete()
+    except:
+        pass
+
+    async with cache_lock:
+        cached = cache.get(url)
+
+    if cached:
+        title, image = cached
+    else:
+        title, image = await get_info(url)
+        async with cache_lock:
+            cache[url] = (title, image)
+
+    love_link = f"https://www.lovegobuy.com/product?shop_type={shop}&id={item_id}&invite_code={INVITE_CODE}"
+
+    embed = discord.Embed(title=f"📦 {title}", color=0x1abc9c)
+    embed.add_field(name="Plateforme", value=shop.upper(), inline=True)
+    embed.add_field(name="ID", value=item_id, inline=True)
+
+    if image:
+        embed.set_image(url=image)
+
+    view = View()
+    view.add_item(Button(label="Ouvrir sur LoveGoBuy", url=love_link))
+
+    await message.channel.send(embed=embed, view=view)
+
+
+async def main():
+    await client.start(TOKEN)
+
+
+async def runner():
+    task = asyncio.create_task(main())
+
+    await shutdown_event.wait()
+
+    await shutdown()
+    await client.close()
+    task.cancel()
+
+
+asyncio.run(runner())
